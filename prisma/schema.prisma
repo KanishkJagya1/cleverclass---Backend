@@ -1,0 +1,357 @@
+// CleverClass Prisma schema (PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  MANAGER
+  ADMIN
+}
+
+enum DiscountType {
+  PERCENT
+  FLAT
+}
+
+enum OrderType {
+  PURCHASE // buy only: ready-made question papers / bundles (digital)
+  PRINT    // print only: catalog papers and/or uploaded documents
+  MIXED    // buy + print in a single order
+}
+
+enum OrderStatus {
+  // PURCHASE orders are a one-time digital buy: created terminal as BOUGHT
+  // (nothing to fulfil — the PDF is downloadable immediately).
+  BOUGHT
+  // PRINT orders flow through physical fulfilment:
+  PLACED
+  PROCESSING
+  PRINTED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PAID
+  FAILED
+  BYPASSED
+  REFUNDED
+}
+
+enum RefundStatus {
+  NONE
+  INITIATED
+  COMPLETED
+  FAILED
+}
+
+enum ItemKind {
+  PAPER
+  PRINT
+}
+
+enum StorageProvider {
+  LOCAL
+  S3
+  GCP
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String?  // null for accounts created via Google sign-in
+  googleId     String?  @unique
+  avatar       String?
+  role         Role     @default(USER)
+  isActive     Boolean  @default(true)
+  // The store a MANAGER belongs to (null for USER/ADMIN). There is a single
+  // default store, so every manager belongs to it.
+  storeId      String?
+  store        Store?   @relation(fields: [storeId], references: [id])
+  // A MANAGER is either PRIMARY (can set print pricing, add/remove managers,
+  // and see the priced print-order record) or ORDINARY (fulfilment queue only).
+  // Ignored for USER/ADMIN.
+  isPrimaryManager Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders           Order[]
+  documents        Document[]
+  priceRequests    PriceChangeRequest[] @relation("PriceRequestCreatedBy")
+  priceEvents      PriceChangeEvent[]   @relation("PriceEventChangedBy")
+
+  @@index([storeId])
+}
+
+// An admin's request to the store's primary manager to change print pricing.
+// Shown as a notification on the manager's Print Pricing page.
+model PriceChangeRequest {
+  id          String   @id @default(cuid())
+  message     String
+  status      String   @default("OPEN") // OPEN | RESOLVED
+  createdById String
+  createdBy   User     @relation("PriceRequestCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+
+  @@index([status])
+}
+
+// A recorded print-pricing change: a before/after snapshot of the pricing model,
+// captured whenever a primary manager saves a change. Shown in the pricing
+// activity log alongside admin change requests.
+model PriceChangeEvent {
+  id          String   @id @default(cuid())
+  before      Json
+  after       Json
+  changedById String?
+  changedBy   User?    @relation("PriceEventChangedBy", fields: [changedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// A physical store/branch that fulfils (prints & delivers) orders.
+model Store {
+  id        String   @id @default(cuid())
+  name      String
+  code      String   @unique
+  city      String?
+  state     String?
+  phone     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  managers User[]
+  orders   Order[]
+
+  @@index([isActive])
+}
+
+// A ready-made question paper the admin lists for sale.
+model Paper {
+  id          String   @id @default(cuid())
+  title       String
+  slug        String   @unique
+  description String?
+  subject     String?
+  board       String? // e.g. CBSE / ICSE / State
+  grade       String? // e.g. Class 10
+  year        Int?
+  coverImage  String?
+  previewText String?
+
+  price       Decimal @db.Decimal(10, 2) // base price
+  // Per-paper scheduled sale (the "by-default sale time" model)
+  salePrice   Decimal? @db.Decimal(10, 2)
+  saleStartsAt DateTime?
+  saleEndsAt   DateTime?
+
+  // The actual file to deliver / print
+  storageProvider StorageProvider @default(LOCAL)
+  fileKey         String // key/path within the provider
+  fileName        String
+  fileSize        Int?
+  pages           Int?
+
+  isActive   Boolean  @default(true)
+  isFeatured Boolean  @default(false)
+  // When true, buyers who purchased this paper may view it in-browser as a
+  // watermarked, page-by-page preview (never the raw downloadable file).
+  viewable   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  orderItems OrderItem[]
+  seriesLinks TestSeriesPaper[]
+
+  @@index([subject])
+  @@index([board])
+  @@index([isActive])
+}
+
+// A test series clubs multiple papers into one buyable bundle.
+model TestSeries {
+  id          String   @id @default(cuid())
+  title       String
+  slug        String   @unique
+  description String?
+  subject     String?
+  coverImage  String?
+  // Bundle price. If null, the price is the summed member prices LESS discountPct
+  // (that's why clubbing is cheaper). An explicit price overrides the discount.
+  price       Decimal? @db.Decimal(10, 2)
+  salePrice   Decimal? @db.Decimal(10, 2)
+  // Percentage the bundle is cheaper than buying its papers separately.
+  discountPct Int      @default(10)
+  isActive    Boolean  @default(true)
+  isFeatured  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  papers      TestSeriesPaper[]
+
+  @@index([isActive])
+}
+
+// Join row: a paper's membership (and order) within a test series.
+model TestSeriesPaper {
+  id       String     @id @default(cuid())
+  series   TestSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  seriesId String
+  paper    Paper      @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  paperId  String
+  position Int        @default(0)
+
+  @@unique([seriesId, paperId])
+  @@index([seriesId])
+  @@index([paperId])
+}
+
+// User-uploaded document to be printed.
+model Document {
+  id              String          @id @default(cuid())
+  userId          String
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storageProvider StorageProvider @default(LOCAL)
+  fileKey         String
+  fileName        String
+  fileSize        Int?
+  pages           Int?
+  createdAt       DateTime        @default(now())
+
+  orderItems OrderItem[]
+
+  @@index([userId])
+}
+
+// Coupons (the "coupon/discount model").
+model Coupon {
+  id          String       @id @default(cuid())
+  code        String       @unique
+  description String?
+  type        DiscountType
+  value       Decimal      @db.Decimal(10, 2) // percent (0-100) or flat amount
+  maxDiscount Decimal?     @db.Decimal(10, 2) // cap for percent coupons
+  minOrder    Decimal?     @db.Decimal(10, 2)
+  startsAt    DateTime?
+  expiresAt   DateTime?
+  usageLimit  Int? // total redemptions allowed
+  usedCount   Int          @default(0)
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  orders Order[]
+}
+
+// Singleton-ish config for print pricing model. Row with id = "default".
+model PrintConfig {
+  id            String   @id @default("default")
+  perPageBW     Decimal  @db.Decimal(10, 2) @default(2.00)
+  perPageColor  Decimal  @db.Decimal(10, 2) @default(8.00)
+  bindingCost   Decimal  @db.Decimal(10, 2) @default(30.00)
+  minCharge     Decimal  @db.Decimal(10, 2) @default(20.00)
+  doubleSidedDiscountPct Decimal @db.Decimal(5, 2) @default(15.00)
+  currency      String   @default("INR")
+  updatedAt     DateTime @updatedAt
+}
+
+model Order {
+  id          String        @id @default(cuid())
+  orderNumber String        @unique
+  userId      String
+  user        User          @relation(fields: [userId], references: [id])
+  type        OrderType
+  // Orders are only ever created once payment succeeds, so PLACED is the
+  // initial state — there is no pending-payment order.
+  status      OrderStatus   @default(PLACED)
+  paymentStatus PaymentStatus
+
+  subtotal Decimal @db.Decimal(10, 2)
+  discount Decimal @db.Decimal(10, 2) @default(0)
+  total    Decimal @db.Decimal(10, 2)
+  currency String  @default("INR")
+
+  // Refund lifecycle (a refund is started when a paid order is cancelled).
+  refundStatus      RefundStatus @default(NONE)
+  refundId          String?
+  refundAmount      Decimal?     @db.Decimal(10, 2)
+  refundInitiatedAt DateTime?
+  refundCompletedAt DateTime?
+
+  couponId   String?
+  coupon     Coupon? @relation(fields: [couponId], references: [id])
+  couponCode String?
+
+  // Which store fulfils this order (auto-routed at checkout; admin can reassign).
+  storeId String?
+  store   Store?  @relation(fields: [storeId], references: [id])
+
+  // Payment (Razorpay)
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  razorpaySignature String?
+
+  // Shipping (for print + delivery of purchased papers if physical)
+  shipName    String
+  shipPhone   String
+  shipEmail   String?
+  shipLine1   String
+  shipLine2   String?
+  shipCity    String
+  shipState   String
+  shipPincode String
+  notes       String?
+
+  items OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([storeId])
+}
+
+model OrderItem {
+  id      String   @id @default(cuid())
+  orderId String
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  kind    ItemKind
+
+  paperId String?
+  paper   Paper?  @relation(fields: [paperId], references: [id])
+
+  documentId String?
+  document   Document? @relation(fields: [documentId], references: [id])
+
+  title     String
+  copies    Int     @default(1)
+  unitPrice Decimal @db.Decimal(10, 2)
+  lineTotal Decimal @db.Decimal(10, 2)
+
+  // If this item was granted as part of a test-series bundle, these snapshot the
+  // bundle it belonged to (kept even if the series is later deleted).
+  seriesId    String?
+  seriesTitle String?
+
+  // Print options (JSON): { color: boolean, doubleSided: boolean, binding: boolean, pages: number }
+  printOptions Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
