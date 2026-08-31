@@ -17,10 +17,18 @@ router.use(requireAuth, requireRole('MANAGER'));
 
 // Payment states a manager may see: paid orders plus refunded (cancelled) ones.
 const MGR_PAYMENT = ['PAID', 'BYPASSED', 'REFUNDED'];
-// Managers only see orders that are paid & ready to fulfil (never pending-payment).
-const FULFILLABLE = ['PLACED', 'PROCESSING', 'PRINTED', 'SHIPPED', 'DELIVERED'];
-// Statuses a manager may filter/view (active queue + cancelled history).
+// The ACTIVE fulfilment queue = orders still needing work. Once DELIVERED (done)
+// an order drops off the active queue (still reviewable via the Delivered filter).
+const ACTIVE_FULFILMENT = ['PLACED', 'PROCESSING', 'PRINTED', 'SHIPPED'];
+const FULFILLABLE = [...ACTIVE_FULFILMENT, 'DELIVERED'];
+// Statuses a manager may filter/view (whole lifecycle + cancelled history).
 const VIEWABLE = [...FULFILLABLE, 'CANCELLED'];
+// Ordinary managers only handle the printing stage: once an order is PRINTED (ready
+// to ship) it leaves their queue — shipping/delivering/cancelling is the primary's job.
+const ORDINARY_QUEUE = ['PLACED', 'PROCESSING'];
+// Default (unfiltered) queue: active work only. Filtering can still reach Delivered/Cancelled.
+const managerQueue = (req) => (req.user.isPrimaryManager ? ACTIVE_FULFILMENT : ORDINARY_QUEUE);
+const managerViewable = (req) => (req.user.isPrimaryManager ? VIEWABLE : ORDINARY_QUEUE);
 
 // Every manager belongs to the single default store; scope their view to it.
 // (A manager with no store assigned sees nothing — the sentinel never matches.)
@@ -29,22 +37,38 @@ function storeScope(req) {
 }
 
 /* ============================ FULFILMENT QUEUE ============================
- * Visible to ALL managers (primary + ordinary). No pricing is exposed here.
+ * All managers see the queue, but ordinary managers are scoped to the printing
+ * stage (PLACED/PROCESSING) — printed-and-beyond orders are the primary's alone.
  */
 
-// GET /api/manager/orders?status=&q=&page=&pageSize=
+// A created-date range (yyyy-mm-dd, inclusive) → a prisma filter, or undefined.
+const isDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+function dateWhere(from, to) {
+  const r = {};
+  if (isDay(from)) r.gte = new Date(from + 'T00:00:00');
+  if (isDay(to)) { const t = new Date(to + 'T00:00:00'); t.setDate(t.getDate() + 1); r.lt = t; }
+  return r.gte || r.lt ? r : undefined;
+}
+
+// GET /api/manager/orders?status=&q=&from=&to=&page=&pageSize=
 router.get(
   '/orders',
   asyncHandler(async (req, res) => {
-    const { status, q } = req.query;
+    const { status, q, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 12 });
+    const viewable = managerViewable(req);
     const where = {
-      status: status && VIEWABLE.includes(status) ? status : { in: FULFILLABLE },
+      status: status && viewable.includes(status) ? status : { in: managerQueue(req) },
       paymentStatus: { in: MGR_PAYMENT },
       ...storeScope(req),
     };
-    // Managers may search by order number only (customer identity is hidden from them).
-    if (q && q.trim()) where.orderNumber = containsInsensitive(q.trim());
+    const range = dateWhere(from, to);
+    if (range) where.createdAt = range;
+    // Managers search by order number or item content (customer identity stays hidden).
+    if (q && q.trim()) {
+      const term = q.trim();
+      where.OR = [{ orderNumber: containsInsensitive(term) }, { items: { some: { title: containsInsensitive(term) } } }];
+    }
     const [orders, total] = await Promise.all([
       prisma.order.findMany({ where, orderBy: { createdAt: 'asc' }, skip, take, include: { items: true } }),
       prisma.order.count({ where }),
@@ -57,12 +81,13 @@ router.get(
 router.get(
   '/stats',
   asyncHandler(async (req, res) => {
+    const viewable = managerViewable(req);
     const groups = await prisma.order.groupBy({
       by: ['status'],
-      where: { paymentStatus: { in: MGR_PAYMENT }, status: { in: VIEWABLE }, ...storeScope(req) },
+      where: { paymentStatus: { in: MGR_PAYMENT }, status: { in: viewable }, ...storeScope(req) },
       _count: { _all: true },
     });
-    const counts = Object.fromEntries(VIEWABLE.map((s) => [s, 0]));
+    const counts = Object.fromEntries(viewable.map((s) => [s, 0]));
     groups.forEach((g) => (counts[g.status] = g._count._all));
     res.json({ counts });
   })
@@ -72,8 +97,9 @@ router.get(
 router.get(
   '/orders/:id',
   asyncHandler(async (req, res) => {
+    // Ordinary managers can't open printed-and-beyond orders (not in their queue).
     const order = await prisma.order.findFirst({
-      where: { id: req.params.id, paymentStatus: { in: MGR_PAYMENT }, ...storeScope(req) },
+      where: { id: req.params.id, paymentStatus: { in: MGR_PAYMENT }, status: { in: managerViewable(req) }, ...storeScope(req) },
       include: { items: true },
     });
     if (!order) throw new ApiError(404, 'Order not found');
@@ -86,8 +112,15 @@ router.patch(
   '/orders/:id/status',
   validate(z.object({ status: z.enum(['PROCESSING', 'PRINTED', 'SHIPPED', 'DELIVERED', 'CANCELLED']) })),
   asyncHandler(async (req, res) => {
+    // Ordinary managers can only move an order through PROCESSING/PRINTED.
+    // Shipping, delivering, and cancelling are reserved for the primary manager.
+    if (!req.user.isPrimaryManager && ['SHIPPED', 'DELIVERED', 'CANCELLED'].includes(req.body.status)) {
+      throw new ApiError(403, 'Only the primary manager can ship, deliver, or cancel orders.');
+    }
+    // Ordinary managers can only act on orders currently in their queue (PLACED/PROCESSING);
+    // a printed-and-beyond order is out of their scope entirely.
     const order = await prisma.order.findFirst({
-      where: { id: req.params.id, paymentStatus: { in: MGR_PAYMENT }, ...storeScope(req) },
+      where: { id: req.params.id, paymentStatus: { in: MGR_PAYMENT }, status: { in: managerViewable(req) }, ...storeScope(req) },
     });
     if (!order) throw new ApiError(404, 'Order not found');
     const updated = await changeOrderStatus({ order, status: req.body.status, include: { items: true } });
@@ -284,7 +317,7 @@ router.get(
   '/print-orders',
   requirePrimaryManager,
   asyncHandler(async (req, res) => {
-    const { status, q } = req.query;
+    const { status, q, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
     // PRINT and MIXED orders both carry print work for the store.
     const where = {
@@ -293,7 +326,12 @@ router.get(
       ...storeScope(req),
       ...(status && VIEWABLE.includes(status) ? { status } : {}),
     };
-    if (q && q.trim()) where.orderNumber = containsInsensitive(q.trim());
+    const range = dateWhere(from, to);
+    if (range) where.createdAt = range;
+    if (q && q.trim()) {
+      const term = q.trim();
+      where.OR = [{ orderNumber: containsInsensitive(term) }, { items: { some: { title: containsInsensitive(term) } } }];
+    }
     const [orders, total, revenueAgg] = await Promise.all([
       prisma.order.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take, include: { items: true } }),
       prisma.order.count({ where }),

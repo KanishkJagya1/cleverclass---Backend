@@ -9,10 +9,10 @@ import { saveFile, deleteFile } from '../lib/storage.js';
 import { serializePaper, serializeOrder, serializeTestSeries } from '../utils/serializers.js';
 import { uniqueSlug } from '../utils/slug.js';
 import { countPdfPages } from '../utils/pdf.js';
+import { fetchRemotePdf, fetchRemoteImage } from '../utils/remotePdf.js';
 import { changeOrderStatus, resolveRefund } from '../lib/orderStatus.js';
 import { getPrintConfig } from './config.routes.js';
 import { parsePagination, paginate, containsInsensitive } from '../utils/pagination.js';
-import { money } from '../utils/pricing.js';
 
 const router = Router();
 router.use(requireAuth, requireRole('ADMIN'));
@@ -28,7 +28,7 @@ router.get(
   asyncHandler(async (_req, res) => {
     const paidWhere = { paymentStatus: { in: ['PAID', 'BYPASSED'] } };
 
-    const [users, papers, orders, paidAgg, pending, coupons, recent, printDebtAgg] = await Promise.all([
+    const [users, papers, orders, paidAgg, pending, coupons, recent] = await Promise.all([
       prisma.user.count({ where: { role: 'USER' } }),
       prisma.paper.count(),
       prisma.order.count(),
@@ -40,8 +40,6 @@ router.get(
         orderBy: { createdAt: 'desc' },
         include: { items: true, user: true },
       }),
-      // The store is owed the print revenue (the admin collects it, then settles).
-      prisma.orderItem.aggregate({ _sum: { lineTotal: true }, where: { kind: 'PRINT', order: { ...paidWhere, status: { not: 'CANCELLED' } } } }),
     ]);
 
     res.json({
@@ -52,7 +50,6 @@ router.get(
         revenue: Number(paidAgg._sum.total || 0),
         pendingFulfilment: pending,
         activeCoupons: coupons,
-        storeDebt: Number(printDebtAgg._sum.lineTotal || 0),
       },
       recentOrders: recent.map((o) => serializeOrder(o)),
     });
@@ -65,7 +62,7 @@ router.get(
 router.get(
   '/papers',
   asyncHandler(async (req, res) => {
-    const { q, status, featured, sale } = req.query;
+    const { q, status, featured, sale, from, to } = req.query;
     const where = {};
     if (q && q.trim()) {
       const term = q.trim();
@@ -74,6 +71,7 @@ router.get(
         { subject: containsInsensitive(term) },
         { board: containsInsensitive(term) },
         { grade: containsInsensitive(term) },
+        { description: containsInsensitive(term) },
       ];
     }
     if (status === 'active') where.isActive = true;
@@ -82,6 +80,7 @@ router.get(
     else if (featured === 'plain') where.isFeatured = false;
     if (sale === 'sale') where.salePrice = { not: null };
     else if (sale === 'regular') where.salePrice = null;
+    applyDateRange(where, from, to);
 
     // `?all=1` returns every matching paper unpaginated — used by the series
     // paper-picker where the full list must be selectable.
@@ -240,6 +239,155 @@ router.delete(
   })
 );
 
+/* ===================== BULK PAPER IMPORT (CSV) ===================== */
+// Duplicate identity = normalized title + board + grade + year (metadata only).
+const normKey = (r) => [r.title, r.board, r.grade, r.year].map((v) => String(v ?? '').trim().toLowerCase()).join('|');
+
+// Run an async mapper over items with limited concurrency (downloads are network-bound).
+async function mapPool(items, limit, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length || 1) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function saveCoverFromBuffer(buffer, mimetype, originalName) {
+  const c = await saveFile({ buffer, originalName: originalName || 'cover', mimetype, folder: 'papers/covers' });
+  return `/api/download/asset?provider=${c.provider}&key=${encodeURIComponent(c.key)}`;
+}
+
+// Check which CSV rows already exist in the DB (by normalized metadata key).
+router.post(
+  '/papers/bulk/check',
+  validate(z.object({
+    rows: z.array(z.object({
+      title: z.string(),
+      board: z.string().nullable().optional(),
+      grade: z.string().nullable().optional(),
+      year: z.union([z.number(), z.string()]).nullable().optional(),
+    })).max(2000),
+  })),
+  asyncHandler(async (req, res) => {
+    const { rows } = req.body;
+    const titles = [...new Set(rows.map((r) => (r.title || '').trim()).filter(Boolean))];
+    if (!titles.length) return res.json({ matches: {} });
+    const candidates = await prisma.paper.findMany({
+      where: { OR: titles.map((t) => ({ title: { equals: t, mode: 'insensitive' } })) },
+      select: { id: true, title: true, board: true, grade: true, year: true, isActive: true },
+    });
+    const byKey = new Map();
+    for (const p of candidates) byKey.set(normKey(p), { id: p.id, title: p.title, isActive: p.isActive });
+    const matches = {};
+    rows.forEach((r, i) => { const m = byKey.get(normKey(r)); if (m) matches[i] = m; });
+    res.json({ matches });
+  })
+);
+
+// Commit the reviewed rows: create new papers / update existing / skip, downloading each
+// PDF from its link (or an attached override file). Returns per-row results + resolved paper ids.
+router.post(
+  '/papers/bulk/commit',
+  uploadPaperAssets.any(),
+  asyncHandler(async (req, res) => {
+    let payload;
+    try { payload = JSON.parse(req.body.payload || '{}'); } catch { throw new ApiError(400, 'Invalid payload'); }
+    const rows = Array.isArray(payload.rows) ? payload.rows : [];
+    if (!rows.length) throw new ApiError(400, 'No rows to import');
+    const defaultActive = payload.defaultActive !== false; // series mode passes false
+    const filesByField = {};
+    for (const f of req.files || []) filesByField[f.fieldname] = f;
+
+    const results = await mapPool(rows, 4, async (row, index) => {
+      try {
+        const resolution = row.resolution || 'create';
+        if (resolution === 'skip') {
+          return { index, status: 'skipped', id: row.existingId || null };
+        }
+        if (!row.title || row.price === undefined || row.price === '' || row.price === null) {
+          throw new ApiError(400, 'title and price are required');
+        }
+
+        // Resolve the PDF: an attached override file wins, else the link.
+        const attached = row.fileField ? filesByField[row.fileField] : null;
+        let pdfBuffer = null;
+        let pdfName = null;
+        if (attached) { pdfBuffer = attached.buffer; pdfName = attached.originalname; }
+        else if (row.pdfUrl) { pdfBuffer = await fetchRemotePdf(row.pdfUrl); pdfName = `${row.title}.pdf`; }
+
+        // Resolve the cover (optional): attached override file, else the link.
+        const coverAttached = row.coverField ? filesByField[row.coverField] : null;
+        let coverUrl = null;
+        if (coverAttached) coverUrl = await saveCoverFromBuffer(coverAttached.buffer, coverAttached.mimetype, coverAttached.originalname);
+        else if (row.coverImageUrl) { try { const img = await fetchRemoteImage(row.coverImageUrl); coverUrl = await saveCoverFromBuffer(img.buffer, img.mimetype, 'cover'); } catch { /* cover is optional */ } }
+
+        const active = row.active === undefined ? defaultActive : Boolean(row.active);
+        const scalar = {
+          title: row.title,
+          description: row.description || null,
+          subject: row.subject || null,
+          board: row.board || null,
+          grade: row.grade || null,
+          year: toNum(row.year) || null,
+          previewText: row.previewText || null,
+          price: Number(row.price),
+          salePrice: toNum(row.salePrice) ?? null,
+          isActive: active,
+          isFeatured: Boolean(row.featured),
+          viewable: Boolean(row.viewable),
+        };
+
+        if (resolution === 'update' && row.existingId) {
+          const existing = await prisma.paper.findUnique({ where: { id: row.existingId } });
+          if (!existing) throw new ApiError(404, 'Existing paper not found');
+          const data = { ...scalar };
+          if (coverUrl) data.coverImage = coverUrl;
+          if (pdfBuffer) {
+            const saved = await saveFile({ buffer: pdfBuffer, originalName: pdfName, mimetype: 'application/pdf', folder: 'papers' });
+            if (existing.fileKey) await deleteFile({ provider: existing.storageProvider, key: existing.fileKey }).catch(() => {});
+            data.storageProvider = saved.provider;
+            data.fileKey = saved.key;
+            data.fileName = saved.fileName;
+            data.fileSize = saved.size;
+            data.pages = countPdfPages(pdfBuffer) || existing.pages;
+          }
+          const p = await prisma.paper.update({ where: { id: existing.id }, data });
+          return { index, status: 'updated', id: p.id };
+        }
+
+        // create
+        if (!pdfBuffer) throw new ApiError(400, 'No PDF — add a valid link or attach a file');
+        const saved = await saveFile({ buffer: pdfBuffer, originalName: pdfName, mimetype: 'application/pdf', folder: 'papers' });
+        const slug = await uniqueSlug(row.title, async (s) => Boolean(await prisma.paper.findUnique({ where: { slug: s } })));
+        const p = await prisma.paper.create({
+          data: {
+            ...scalar,
+            slug,
+            coverImage: coverUrl,
+            storageProvider: saved.provider,
+            fileKey: saved.key,
+            fileName: saved.fileName,
+            fileSize: saved.size,
+            pages: countPdfPages(pdfBuffer) || null,
+          },
+        });
+        return { index, status: 'created', id: p.id };
+      } catch (e) {
+        return { index, status: 'failed', error: e.message || 'Failed' };
+      }
+    });
+
+    // Resolved paper ids in row order (for the series modal to attach), skipping failures.
+    const paperIds = results.filter((r) => r.id).map((r) => r.id);
+    res.json({ results, paperIds });
+  })
+);
+
 /* ============================== TEST SERIES ============================== */
 const seriesWithPapers = { papers: { orderBy: { position: 'asc' }, include: { paper: true } } };
 
@@ -257,13 +405,19 @@ async function setSeriesPapers(seriesId, paperIds) {
   }
 }
 
-// List all series (incl inactive), paginated + searchable.
+// List all series (incl inactive), paginated + searchable + filterable.
 router.get(
   '/series',
   asyncHandler(async (req, res) => {
-    const { q } = req.query;
+    const { q, status, featured, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
-    const where = q && q.trim() ? { OR: [{ title: containsInsensitive(q.trim()) }, { subject: containsInsensitive(q.trim()) }] } : {};
+    const where = {};
+    if (q && q.trim()) where.OR = [{ title: containsInsensitive(q.trim()) }, { subject: containsInsensitive(q.trim()) }];
+    if (status === 'active') where.isActive = true;
+    else if (status === 'hidden') where.isActive = false;
+    if (featured === 'featured') where.isFeatured = true;
+    else if (featured === 'plain') where.isFeatured = false;
+    applyDateRange(where, from, to);
     const [series, total] = await Promise.all([
       prisma.testSeries.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take, include: seriesWithPapers }),
       prisma.testSeries.count({ where }),
@@ -358,7 +512,7 @@ const couponSchema = z.object({
 router.get(
   '/coupons',
   asyncHandler(async (req, res) => {
-    const { q, status, type } = req.query;
+    const { q, status, type, from, to } = req.query;
     const where = {};
     const and = [];
     if (q && q.trim()) {
@@ -376,6 +530,7 @@ router.get(
       and.push({ expiresAt: { lt: now } });
     }
     if (and.length) where.AND = and;
+    applyDateRange(where, from, to);
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
     const [coupons, total] = await Promise.all([
       prisma.coupon.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take }),
@@ -473,19 +628,32 @@ router.get(
   })
 );
 
-// GET /api/admin/print-config/requests -> paginated request history (newest first)
+// GET /api/admin/print-config/requests -> paginated request history (newest first),
+// searchable by message/sender and filterable by status.
 router.get(
   '/print-config/requests',
   asyncHandler(async (req, res) => {
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 5 });
+    const q = (req.query.q || '').trim();
+    const { status, from, to } = req.query;
+    const where = {};
+    if (status === 'OPEN' || status === 'RESOLVED') where.status = status;
+    if (q) {
+      where.OR = [
+        { message: containsInsensitive(q) },
+        { createdBy: { name: containsInsensitive(q) } },
+      ];
+    }
+    applyDateRange(where, from, to);
     const [requests, total] = await Promise.all([
       prisma.priceChangeRequest.findMany({
+        where,
         orderBy: { createdAt: 'desc' },
         skip,
         take,
         include: { createdBy: { select: { id: true, name: true } } },
       }),
-      prisma.priceChangeRequest.count(),
+      prisma.priceChangeRequest.count({ where }),
     ]);
     res.json(paginate(requests.map(serializeRequest), total, page, pageSize));
   })
@@ -528,18 +696,30 @@ router.patch(
 );
 
 /* ============================== ORDERS ============================== */
-const FULFILLABLE_STATUSES = ['PLACED', 'PROCESSING', 'PRINTED', 'SHIPPED', 'DELIVERED'];
+// The ACTIVE fulfilment queue excludes DELIVERED (done) — delivered orders drop off
+// the queue and are reviewed via the Orders list / a Delivered status filter.
+const ACTIVE_FULFILMENT = ['PLACED', 'PROCESSING', 'PRINTED', 'SHIPPED'];
 
-// Build an order WHERE clause from status/type/stage/search query params.
-function buildOrderWhere({ status, type, stage, q }) {
+// Apply a created-date range (yyyy-mm-dd, inclusive) to a WHERE clause.
+function applyDateRange(where, from, to, field = 'createdAt') {
+  const isDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const range = {};
+  if (isDay(from)) range.gte = new Date(from + 'T00:00:00');
+  if (isDay(to)) { const t = new Date(to + 'T00:00:00'); t.setDate(t.getDate() + 1); range.lt = t; }
+  if (range.gte || range.lt) where[field] = range;
+}
+
+// Build an order WHERE clause from status/type/stage/date/search query params.
+function buildOrderWhere({ status, type, stage, q, from, to }) {
   const where = {};
   if (status) where.status = status;
   if (type) where.type = type;
-  // stage=fulfilment -> paid orders still moving through the print/ship pipeline
+  // stage=fulfilment -> paid orders still actively moving through the print/ship pipeline
   if (stage === 'fulfilment') {
     where.paymentStatus = { in: ['PAID', 'BYPASSED'] };
-    if (!status) where.status = { in: FULFILLABLE_STATUSES };
+    if (!status) where.status = { in: ACTIVE_FULFILMENT };
   }
+  applyDateRange(where, from, to);
   applyOrderSearch(where, q);
   return where;
 }
@@ -558,6 +738,8 @@ function applyOrderSearch(where, q) {
     { user: { is: { name: containsInsensitive(term) } } },
     { user: { is: { email: containsInsensitive(term) } } },
     { user: { is: { phone: containsInsensitive(term) } } },
+    // Content: match an order by any of its item titles (paper / print / series).
+    { items: { some: { title: containsInsensitive(term) } } },
   ];
   // Date term → match orders created that calendar day.
   const day = /^\d{4}-\d{2}-\d{2}$/.test(term) ? new Date(term + 'T00:00:00') : null;
@@ -572,9 +754,9 @@ function applyOrderSearch(where, q) {
 router.get(
   '/orders',
   asyncHandler(async (req, res) => {
-    const { status, type, stage, q } = req.query;
+    const { status, type, stage, q, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
-    const where = buildOrderWhere({ status, type, stage, q });
+    const where = buildOrderWhere({ status, type, stage, q, from, to });
     const [orders, total] = await Promise.all([
       prisma.order.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take, include: { items: true, user: true } }),
       prisma.order.count({ where }),
@@ -614,50 +796,15 @@ router.patch(
   })
 );
 
-/* ============================== STORE DEBT ==============================
- * The customer pays the platform; the store fulfils printing. So the admin owes
- * the store the PRINT revenue. This lists the print portion of each order and
- * the running total owed (cancelled/refunded orders are excluded from the total).
- */
-router.get(
-  '/store-debt',
-  asyncHandler(async (req, res) => {
-    const { q } = req.query;
-    const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
-    const where = { type: { in: ['PRINT', 'MIXED'] }, paymentStatus: { in: ['PAID', 'BYPASSED'] } };
-    applyOrderSearch(where, q);
-    const [orders, total, owedAgg] = await Promise.all([
-      prisma.order.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take, include: { items: true, user: true } }),
-      prisma.order.count({ where }),
-      prisma.orderItem.aggregate({ _sum: { lineTotal: true }, where: { kind: 'PRINT', order: { ...where, status: { not: 'CANCELLED' } } } }),
-    ]);
-    const rows = orders.map((o) => {
-      const printItems = o.items.filter((i) => i.kind === 'PRINT');
-      const printTotal = money(printItems.reduce((s, i) => s + Number(i.lineTotal), 0));
-      return {
-        id: o.id,
-        orderNumber: o.orderNumber,
-        createdAt: o.createdAt,
-        status: o.status,
-        type: o.type,
-        customer: o.user?.name || null,
-        pdfCount: printItems.length,
-        totalPaid: Number(o.total), // what the customer paid for the whole order
-        printTotal, // the store's share (owed to the store) — highlighted in the UI
-      };
-    });
-    res.json(paginate(rows, total, page, pageSize, { totalDebt: Number(owedAgg._sum.lineTotal || 0) }));
-  })
-);
-
 /* ============================== REFUNDS ============================== */
 // List every order with a refund in any state (newest first) — searchable + paginated.
 router.get(
   '/refunds',
   asyncHandler(async (req, res) => {
-    const { q, status } = req.query;
+    const { q, status, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
     const where = { refundStatus: status ? status : { not: 'NONE' } };
+    applyDateRange(where, from, to, 'refundInitiatedAt');
     applyOrderSearch(where, q);
     const [orders, total] = await Promise.all([
       prisma.order.findMany({ where, orderBy: { refundInitiatedAt: 'desc' }, skip, take, include: { items: true, user: true } }),
@@ -699,7 +846,7 @@ const userSelect = {
 router.get(
   '/users',
   asyncHandler(async (req, res) => {
-    const { role, q } = req.query;
+    const { role, q, from, to } = req.query;
     const { page, pageSize, skip, take } = parsePagination(req.query, { defaultPageSize: 10 });
     const where = {};
     if (role) where.role = role;
@@ -711,6 +858,7 @@ router.get(
         { phone: containsInsensitive(term) },
       ];
     }
+    applyDateRange(where, from, to);
     const [users, total] = await Promise.all([
       prisma.user.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take, select: userSelect }),
       prisma.user.count({ where }),

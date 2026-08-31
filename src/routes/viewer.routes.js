@@ -19,12 +19,15 @@ async function ownsPaper(userId, paperId) {
 }
 
 // Load a paper the caller may READ in full: the owner (bought it) or an admin.
+// Ownership — not catalog visibility — governs reading, so an owner can read a
+// paper that is inactive (e.g. a bundle-only series member).
 async function loadReadable(req, paperId) {
   const paper = await prisma.paper.findUnique({ where: { id: paperId } });
-  if (!paper || !paper.isActive) throw new ApiError(404, 'Paper not found');
+  if (!paper) throw new ApiError(404, 'Paper not found');
   if (req.user.role !== 'ADMIN' && !(await ownsPaper(req.user.id, paper.id))) {
     throw new ApiError(403, 'You have not purchased this paper');
   }
+  if (!paper.fileKey) throw new ApiError(404, 'This paper has no file yet');
   return paper;
 }
 

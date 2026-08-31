@@ -99,7 +99,8 @@ async function buildItems(items, userId) {
         include: { papers: { orderBy: { position: 'asc' }, include: { paper: true } } },
       });
       if (!series) throw new ApiError(404, 'Test series not found');
-      const members = series.papers.map((l) => l.paper).filter((p) => p && p.isActive);
+      // Include every member — even inactive (bundle-only) papers are sold with the series.
+    const members = series.papers.map((l) => l.paper).filter((p) => p);
       if (!members.length) throw new ApiError(400, 'This series has no papers to sell');
       // Papers the buyer already owns are excluded — not re-charged, not re-granted.
       const ownedFlags = await Promise.all(members.map((p) => ownsPaper(userId, p.id)));
@@ -115,13 +116,16 @@ async function buildItems(items, userId) {
       // PRINT — catalog paper or uploaded document, priced only by the print model.
       const c = await getCfg();
       if (it.paperId) {
-        const paper = await prisma.paper.findFirst({ where: { id: it.paperId, isActive: true } });
+        // Printing needs the file, not catalog visibility — inactive (bundle-only) papers print fine.
+        const paper = await prisma.paper.findFirst({ where: { id: it.paperId } });
         if (!paper) throw new ApiError(404, `Paper ${it.paperId} not found`);
-        built.push(buildPrintItem(c, { title: paper.title, paperId: paper.id }, { ...it, pages: it.pages || paper.pages || 1 }));
+        // Page count is authoritative from the paper/PDF — never trust the client
+        // (it drives the price). Fall back to the client estimate only if unknown.
+        built.push(buildPrintItem(c, { title: paper.title, paperId: paper.id }, { ...it, pages: paper.pages || it.pages || 1 }));
       } else if (it.documentId) {
         const doc = await prisma.document.findFirst({ where: { id: it.documentId, userId } });
         if (!doc) throw new ApiError(404, `Document ${it.documentId} not found`);
-        built.push(buildPrintItem(c, { title: doc.fileName, documentId: doc.id }, { ...it, pages: it.pages || doc.pages || 1 }));
+        built.push(buildPrintItem(c, { title: doc.fileName, documentId: doc.id }, { ...it, pages: doc.pages || it.pages || 1 }));
       } else {
         throw new ApiError(400, 'Each PRINT item requires a paperId or documentId');
       }
@@ -357,7 +361,8 @@ router.get(
       include: { papers: { orderBy: { position: 'asc' }, include: { paper: true } } },
     });
     if (!series) throw new ApiError(404, 'Test series not found');
-    const members = series.papers.map((l) => l.paper).filter((p) => p && p.isActive);
+    // Include every member — even inactive (bundle-only) papers are sold with the series.
+    const members = series.papers.map((l) => l.paper).filter((p) => p);
     const ownedFlags = await Promise.all(members.map((p) => ownsPaper(req.user.id, p.id)));
     const ownedIds = new Set(members.filter((_p, i) => ownedFlags[i]).map((p) => p.id));
     const q = seriesQuote(series, members, ownedIds);
@@ -420,9 +425,14 @@ router.get(
   '/',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { q, type } = req.query;
+    const { q, type, from, to } = req.query;
     const where = { userId: req.user.id };
     if (type) where.type = type;
+    const isDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+    const range = {};
+    if (isDay(from)) range.gte = new Date(from + 'T00:00:00');
+    if (isDay(to)) { const t = new Date(to + 'T00:00:00'); t.setDate(t.getDate() + 1); range.lt = t; }
+    if (range.gte || range.lt) where.createdAt = range;
     if (q && q.trim()) {
       const term = q.trim();
       where.OR = [
